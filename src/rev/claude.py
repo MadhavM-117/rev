@@ -57,7 +57,6 @@ class ClaudeRunner:
             "claude",
             "--print",
             "--output-format", "json",
-            "--tools", "",
             "--max-turns", str(self.max_turns),
         ]
 
@@ -110,8 +109,15 @@ class ClaudeRunner:
         if structured is None:
             result_text = raw.get("result", "")
             if result_text:
+                text = result_text.strip()
+                if text.startswith("```"):
+                    first_nl = text.find("\n")
+                    if first_nl != -1:
+                        text = text[first_nl + 1:]
+                    if text.endswith("```"):
+                        text = text[:-3].strip()
                 try:
-                    structured = json.loads(result_text)
+                    structured = json.loads(text)
                 except json.JSONDecodeError:
                     pass
 

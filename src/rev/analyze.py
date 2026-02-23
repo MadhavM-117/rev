@@ -77,9 +77,7 @@ def _get_diff(ref: Optional[str]) -> str:
     cmd = ["git", "diff"] if ref is None else ["git", "diff", ref]
 
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, check=False
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     except FileNotFoundError:
         err_console.print("[red]error:[/red] git not found in PATH")
         raise typer.Exit(1)
@@ -139,7 +137,7 @@ def run_analyze(
         console.print("[yellow]warning:[/yellow] diff is empty — nothing to analyze")
         raise typer.Exit(0)
 
-    runner = ClaudeRunner(model=model, timeout=timeout)
+    runner = ClaudeRunner(model=model, timeout=timeout, max_turns=2)
 
     try:
         result = runner.run(
@@ -156,9 +154,10 @@ def run_analyze(
         raise typer.Exit(1)
 
     if result.structured is None:
-        err_console.print(
-            "[red]error:[/red] claude did not return structured output"
-        )
+        preview = (result.text or "")[:500]
+        err_console.print("[red]error:[/red] claude did not return structured output")
+        if preview:
+            err_console.print(f"[dim]claude returned:[/dim]\n{preview}")
         raise typer.Exit(1)
 
     if raw:

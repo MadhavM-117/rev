@@ -16,6 +16,11 @@ app = typer.Typer(
 )
 
 
+@app.callback()
+def _() -> None:
+    pass
+
+
 @app.command("analyze")
 def analyze(
     ref: Annotated[
