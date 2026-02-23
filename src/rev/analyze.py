@@ -12,6 +12,7 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 from rich.rule import Rule
+from rich.syntax import Syntax
 from rich.text import Text
 
 from .claude import ClaudeError, ClaudeNotFoundError, ClaudeRunner
@@ -30,6 +31,7 @@ Given a unified diff, produce a structured analysis with three fields:
     - title: An imperative phrase of at most 8 words.
     - explanation: 1-3 sentences describing what this chunk does and why.
     - files: The list of file paths touched by this chunk.
+    - diff: The relevant unified-diff lines for this chunk, copied verbatim from the input.
 
 Rules:
 - Group changes by semantic purpose, not by file. A single chunk may span multiple files.
@@ -48,7 +50,7 @@ _JSON_SCHEMA = {
             "type": "array",
             "items": {
                 "type": "object",
-                "required": ["title", "explanation", "files"],
+                "required": ["title", "explanation", "files", "diff"],
                 "additionalProperties": False,
                 "properties": {
                     "title": {"type": "string"},
@@ -57,6 +59,7 @@ _JSON_SCHEMA = {
                         "type": "array",
                         "items": {"type": "string"},
                     },
+                    "diff": {"type": "string"},
                 },
             },
         },
@@ -123,6 +126,10 @@ def _display(analysis: dict) -> None:
             body += f"\n\n{file_list}"
 
         console.print(Panel(body, border_style="yellow"))
+
+        diff_text = chunk.get("diff", "")
+        if diff_text:
+            console.print(Syntax(diff_text, "diff", theme="ansi_dark"))
 
 
 def run_analyze(
