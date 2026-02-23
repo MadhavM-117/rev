@@ -6,10 +6,15 @@ import json
 import shutil
 import subprocess
 import sys
+import termios
+import tty
+from contextlib import contextmanager
 from typing import Optional
 
 import typer
+from rich.align import Align
 from rich.console import Console
+from rich.padding import Padding
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.syntax import Syntax
@@ -20,13 +25,16 @@ from .claude import ClaudeError, ClaudeNotFoundError, ClaudeRunner
 console = Console()
 err_console = Console(stderr=True)
 
+_KEY_RIGHT = "\x1b[C"
+_KEY_LEFT = "\x1b[D"
+
 _SYSTEM_PROMPT = """\
 You are a senior engineer performing a code review.
 Given a unified diff, produce a structured analysis with three fields:
 
 - intent: A single crisp sentence describing the overall purpose of this change.
 - summary: 2-3 sentences of narrative context — what changed and why it matters.
-- chunks: An ordered list of semantic groups, from most to least architecturally
+- chunks: An ordered list of fine-grained semantic units, from most to least architecturally
   significant. Each chunk has:
     - title: An imperative phrase of at most 8 words.
     - explanation: 1-3 sentences describing what this chunk does and why.
@@ -34,7 +42,13 @@ Given a unified diff, produce a structured analysis with three fields:
     - diff: The relevant unified-diff lines for this chunk, copied verbatim from the input.
 
 Rules:
-- Group changes by semantic purpose, not by file. A single chunk may span multiple files.
+- Chunk at the HIGHEST possible resolution. Each chunk should represent one coherent,
+  atomic semantic idea — a single function added, a single behaviour changed, a single
+  data structure modified, a single import reorganised, etc.
+- A single file MUST produce multiple chunks whenever it contains multiple distinct
+  semantic changes. Never group all edits from one file into a single chunk.
+- A chunk may span multiple files only when the changes are truly inseparable (e.g. an
+  interface definition and its sole implementation changed together).
 - Be factual. Do not speculate beyond what the diff shows.
 - Do not summarize trivial whitespace or formatting changes unless they are the only change.
 """
@@ -90,6 +104,120 @@ def _get_diff(ref: Optional[str]) -> str:
         raise typer.Exit(1)
 
     return result.stdout
+
+
+@contextmanager
+def _raw_mode(tty_file):
+    fd = tty_file.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        yield
+    finally:
+        termios.tcsetattr(fd, termios.TCSAFLUSH, old)
+
+
+def _read_key(tty_file) -> str:
+    ch = tty_file.read(1)
+    if ch == "\x1b":
+        ch += tty_file.read(2)
+    return ch
+
+
+def _render_chunk(idx: int, chunks: list, analysis: dict, con: Console) -> None:
+    intent = analysis.get("intent", "")
+    summary = analysis.get("summary", "")
+    total = len(chunks)
+    chunk = chunks[idx]
+
+    title = chunk.get("title", f"Chunk {idx + 1}")
+    explanation = chunk.get("explanation", "")
+    files = chunk.get("files", [])
+    diff_text = chunk.get("diff", "")
+
+    con.clear()
+
+    con.print(
+        Panel(
+            Text(intent, style="bold"),
+            title="Intent",
+            border_style="cyan",
+        )
+    )
+
+    con.print(
+        Panel(
+            summary,
+            title="Summary",
+            border_style="blue",
+        )
+    )
+
+    con.print(
+        Panel(
+            Padding(Text(title, style="bold"), (0, 1)),
+            title=f"Chunk {idx + 1} of {total}",
+            border_style="cyan",
+        )
+    )
+
+    con.print(Padding(explanation, (0, 1)))
+
+    if files:
+        file_list = "\n".join(f"  [green]{f}[/green]" for f in files)
+        con.print(file_list)
+
+    con.print(Rule())
+
+    if diff_text:
+        con.print(Syntax(diff_text, "diff", theme="ansi_dark"))
+
+    con.print(Rule())
+
+    if total == 1:
+        nav = "[dim]q quit[/dim]"
+    else:
+        left = "[dim]←[/dim]" if idx == 0 else "[bold]←[/bold]"
+        right = "[dim]→[/dim]" if idx == total - 1 else "[bold]→[/bold]"
+        nav = f"{left} prev   {right} next   [dim]q quit[/dim]"
+
+    con.print(Align.center(nav))
+
+
+def _interactive_display(analysis: dict) -> None:
+    if not sys.stdout.isatty():
+        _display(analysis)
+        return
+
+    chunks = analysis.get("chunks", [])
+    if not chunks:
+        console.print("[yellow]No chunks to display.[/yellow]")
+        return
+
+    try:
+        tty_file = open("/dev/tty", "r")
+    except OSError:
+        _display(analysis)
+        return
+
+    idx = 0
+    try:
+        with _raw_mode(tty_file):
+            while True:
+                _render_chunk(idx, chunks, analysis, console)
+                key = _read_key(tty_file)
+                if key in ("q", "Q", "\x03"):
+                    break
+                elif key == _KEY_RIGHT and idx < len(chunks) - 1:
+                    idx += 1
+                elif key == _KEY_LEFT and idx > 0:
+                    idx -= 1
+    except KeyboardInterrupt:
+        pass
+    finally:
+        tty_file.close()
+
+    console.clear()
 
 
 def _display(analysis: dict) -> None:
@@ -171,4 +299,4 @@ def run_analyze(
         print(json.dumps(result.structured, indent=2))
         return
 
-    _display(result.structured)
+    _interactive_display(result.structured)
