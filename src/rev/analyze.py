@@ -14,7 +14,6 @@ from typing import Optional
 import typer
 from rich.align import Align
 from rich.console import Console
-from rich.padding import Padding
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.syntax import Syntax
@@ -111,7 +110,7 @@ def _raw_mode(tty_file):
     fd = tty_file.fileno()
     old = termios.tcgetattr(fd)
     try:
-        tty.setraw(fd)
+        tty.setcbreak(fd)
         yield
     finally:
         termios.tcsetattr(fd, termios.TCSAFLUSH, old)
@@ -147,25 +146,24 @@ def _render_chunk(idx: int, chunks: list, analysis: dict, con: Console) -> None:
 
     con.print(
         Panel(
-            summary,
+            Text(summary),
             title="Summary",
             border_style="blue",
         )
     )
 
+    body = Text(explanation)
+    if files:
+        body.append("\n\n")
+        body.append("\n".join(f"  {f}" for f in files), style="green")
+
     con.print(
         Panel(
-            Padding(Text(title, style="bold"), (0, 1)),
-            title=f"Chunk {idx + 1} of {total}",
+            body,
+            title=f"[bold]{title}[/bold]  [dim]({idx + 1}/{total})[/dim]",
             border_style="cyan",
         )
     )
-
-    con.print(Padding(explanation, (0, 1)))
-
-    if files:
-        file_list = "\n".join(f"  [green]{f}[/green]" for f in files)
-        con.print(file_list)
 
     con.print(Rule())
 
