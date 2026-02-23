@@ -39,6 +39,14 @@ def analyze(
         bool,
         typer.Option("--raw", "-r", help="Dump structured JSON output instead of rendering."),
     ] = False,
+    debug: Annotated[
+        bool,
+        typer.Option("--debug", "-d", help="Print SDK stream events to stderr."),
+    ] = False,
+    no_cache: Annotated[
+        bool,
+        typer.Option("--no-cache", help="Skip cache lookup and do not write result."),
+    ] = False,
 ) -> None:
     """Analyze a diff and return a structured semantic code review.
 
@@ -48,4 +56,4 @@ def analyze(
       2. ref arg — rev analyze HEAD~1
       3. bare    — rev analyze  (diffs the working tree)
     """
-    run_analyze(ref=ref, model=model, timeout=timeout, raw=raw)
+    run_analyze(ref=ref, model=model, timeout=timeout, raw=raw, debug=debug, cache=not no_cache)

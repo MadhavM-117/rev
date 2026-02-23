@@ -41,10 +41,12 @@ class ClaudeRunner:
         model: str | None = None,
         max_turns: int = 1,
         timeout: int = 120,
+        debug: bool = False,
     ) -> None:
         self.model = model
         self.max_turns = max_turns
         self.timeout = timeout
+        self.debug = debug
 
     def run(
         self,
@@ -62,6 +64,7 @@ class ClaudeRunner:
                         stdin_text=stdin_text,
                         json_schema=json_schema,
                         system_prompt=system_prompt,
+                        debug=self.debug,
                     ),
                     timeout=self.timeout,
                 )
@@ -78,6 +81,7 @@ class ClaudeRunner:
         stdin_text: str | None = None,
         json_schema: dict | None = None,
         system_prompt: str | None = None,
+        debug: bool = False,
     ) -> ClaudeResult:
         full_prompt = prompt
         if stdin_text:
@@ -100,6 +104,9 @@ class ClaudeRunner:
         try:
             result_message: ResultMessage | None = None
             async for message in query(prompt=full_prompt, options=options):
+                if debug:
+                    import sys
+                    print(f"  [stream] {type(message).__name__}", file=sys.stderr, flush=True)
                 if isinstance(message, ResultMessage):
                     result_message = message
         except SDKCLINotFoundError as exc:

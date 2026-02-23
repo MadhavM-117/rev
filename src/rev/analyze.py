@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
 import termios
 import tty
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Optional
 
 import typer
@@ -78,6 +81,49 @@ _JSON_SCHEMA = {
         },
     },
 }
+
+
+def _cache_dir() -> Path:
+    base = Path(os.environ.get("REV_CACHE_DIR", "~/.cache/rev")).expanduser()
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def _repo_root() -> str:
+    """Return the git repo root path for cache isolation, or '' if not in a repo."""
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, check=False,
+        )
+        if r.returncode == 0:
+            return r.stdout.strip()
+    except FileNotFoundError:
+        pass
+    return ""
+
+
+def _cache_key(diff_text: str, model: str) -> str:
+    repo = _repo_root()
+    return hashlib.sha256(f"{repo}\0{model}\0{diff_text}".encode()).hexdigest()
+
+
+def _load_cache(diff_text: str, model: str) -> dict | None:
+    path = _cache_dir() / f"{_cache_key(diff_text, model)}.json"
+    if path.exists():
+        try:
+            return json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return None
+    return None
+
+
+def _save_cache(diff_text: str, model: str, analysis: dict) -> None:
+    try:
+        path = _cache_dir() / f"{_cache_key(diff_text, model)}.json"
+        path.write_text(json.dumps(analysis))
+    except OSError:
+        pass
 
 
 def _get_diff(ref: Optional[str]) -> str:
@@ -263,6 +309,8 @@ def run_analyze(
     model: Optional[str],
     timeout: int,
     raw: bool,
+    debug: bool = False,
+    cache: bool = True,
 ) -> None:
     diff = _get_diff(ref)
 
@@ -270,15 +318,36 @@ def run_analyze(
         console.print("[yellow]warning:[/yellow] diff is empty — nothing to analyze")
         raise typer.Exit(0)
 
-    runner = ClaudeRunner(model=model, timeout=timeout, max_turns=2)
+    cache_model = model or "default"
+
+    if cache and not raw:
+        cached = _load_cache(diff, cache_model)
+        if cached is not None:
+            if debug:
+                err_console.print("[dim]debug: cache hit[/dim]")
+            _interactive_display(cached)
+            return
+        if debug:
+            err_console.print("[dim]debug: cache miss[/dim]")
+
+    runner = ClaudeRunner(model=model, timeout=timeout, max_turns=2, debug=debug)
 
     try:
-        result = runner.run(
-            "Analyze the following diff:",
-            stdin_text=diff,
-            json_schema=_JSON_SCHEMA,
-            system_prompt=_SYSTEM_PROMPT,
-        )
+        if debug:
+            result = runner.run(
+                "Analyze the following diff:",
+                stdin_text=diff,
+                json_schema=_JSON_SCHEMA,
+                system_prompt=_SYSTEM_PROMPT,
+            )
+        else:
+            with console.status("[dim]Analyzing…[/dim]", spinner="dots"):
+                result = runner.run(
+                    "Analyze the following diff:",
+                    stdin_text=diff,
+                    json_schema=_JSON_SCHEMA,
+                    system_prompt=_SYSTEM_PROMPT,
+                )
     except ClaudeNotFoundError as exc:
         err_console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(1)
@@ -293,8 +362,16 @@ def run_analyze(
             err_console.print(f"[dim]claude returned:[/dim]\n{preview}")
         raise typer.Exit(1)
 
+    if debug:
+        cost = f"${result.cost_usd:.4f}" if result.cost_usd else "n/a"
+        dur  = f"{result.duration_ms / 1000:.1f}s" if result.duration_ms else "n/a"
+        err_console.print(f"[dim]debug: done  cost={cost}  duration={dur}[/dim]")
+
     if raw:
         print(json.dumps(result.structured, indent=2))
         return
+
+    if cache:
+        _save_cache(diff, cache_model, result.structured)
 
     _interactive_display(result.structured)
