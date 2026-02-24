@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import hashlib
 import json
 import os
@@ -17,6 +16,7 @@ from pathlib import Path
 from typing import Optional
 
 import typer
+from ast_grep_py import SgRoot
 from rich.align import Align
 from rich.console import Console
 from rich.panel import Panel
@@ -44,16 +44,35 @@ _EXT_TO_RICH_LANG: dict[str, str] = {
     ".sh": "bash",
 }
 
-_BLOCK_START_RE = re.compile(
-    r'^\s*(?:'
-    r'(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+\w+'
-    r'|(?:export\s+)?(?:abstract\s+)?class\s+\w+'
-    r'|(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?(?:async\s+)?fn\s+\w+'
-    r'|func\s+(?:\([^)]*\)\s+)?\w+'
-    r'|(?:(?:public|private|protected|internal|static|async|override|virtual|abstract)\s+)*'
-    r'  [\w<>\[\]]+\s+\w+\s*\('
-    r')'
-)
+_EXT_TO_ASTGREP_LANG: dict[str, str] = {
+    ".py": "python",   ".js": "javascript",  ".jsx": "javascript",
+    ".ts": "typescript", ".tsx": "tsx",
+    ".go": "go",       ".rs": "rust",        ".java": "java",
+    ".c": "c",         ".h": "c",            ".cpp": "cpp",
+    ".cc": "cpp",      ".hpp": "cpp",        ".cxx": "cpp",
+    ".rb": "ruby",     ".kt": "kotlin",      ".swift": "swift",
+    ".cs": "csharp",   ".sh": "bash",
+}
+
+_SCOPE_KINDS: dict[str, list[str]] = {
+    "python":     ["function_definition", "class_definition"],
+    "javascript": ["function_declaration", "function_expression", "arrow_function",
+                   "class_declaration", "method_definition"],
+    "typescript": ["function_declaration", "function_expression", "arrow_function",
+                   "class_declaration", "method_definition"],
+    "tsx":        ["function_declaration", "function_expression", "arrow_function",
+                   "class_declaration", "method_definition"],
+    "go":         ["function_declaration", "method_declaration"],
+    "rust":       ["function_item", "impl_item"],
+    "java":       ["method_declaration", "class_declaration", "constructor_declaration"],
+    "c":          ["function_definition"],
+    "cpp":        ["function_definition"],
+    "ruby":       ["method", "singleton_method", "class"],
+    "kotlin":     ["function_declaration", "class_declaration"],
+    "swift":      ["function_declaration", "class_declaration"],
+    "csharp":     ["method_declaration", "class_declaration", "constructor_declaration"],
+    "bash":       ["function_definition"],
+}
 
 _SYSTEM_PROMPT = """\
 You are a senior engineer performing a code review.
@@ -145,130 +164,99 @@ def _parse_chunk_locations(diff_text: str) -> list[tuple[str, set[int]]]:
     return results
 
 
-def _build_python_class_outline(cls_node: ast.ClassDef, changed_lines: set[int], lines: list[str]) -> str:
+def _find_parent_class_sg(node) -> "SgNode | None":
+    """Walk ancestors until a class_definition is found, or return None."""
+    p = node.parent()
+    while p is not None:
+        if p.kind() == "class_definition":
+            return p
+        p = p.parent()
+    return None
+
+
+def _build_class_outline_sg(cls_node, changed_lines: set[int], source: str) -> str:
     """Return a collapsed class outline with full methods only where lines overlap changed_lines."""
-    out: list[str] = []
+    lines = source.splitlines()
+    cls_start = cls_node.range().start.line  # 0-indexed
+    body = cls_node.field("body")
+    body_start = body.range().start.line  # 0-indexed
 
-    # Class header up to first body line
-    header_end = cls_node.body[0].lineno - 1 if cls_node.body else cls_node.end_lineno
-    out.extend(lines[cls_node.lineno - 1 : header_end])
+    out: list[str] = list(lines[cls_start : body_start])
 
-    # Docstring if present
-    first = cls_node.body[0] if cls_node.body else None
-    if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
-        out.extend(lines[first.lineno - 1 : first.end_lineno])
-        body_nodes = cls_node.body[1:]
-    else:
-        body_nodes = cls_node.body
-
-    for node in body_nodes:
-        node_start = getattr(node, 'lineno', None)
-        node_end = getattr(node, 'end_lineno', None)
-        if node_start is None or node_end is None:
+    for child in body.children():
+        if not child.is_named():
             continue
-        node_range = set(range(node_start, node_end + 1))
-        if node_range & changed_lines:
-            # Include decorators
-            deco_start = node_start
-            if hasattr(node, 'decorator_list') and node.decorator_list:
-                deco_start = node.decorator_list[0].lineno
-            out.extend(lines[deco_start - 1 : node_end])
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            indent = len(lines[node_start - 1]) - len(lines[node_start - 1].lstrip())
-            name = node.name
+        rng = child.range()
+        child_start_0 = rng.start.line   # 0-indexed
+        child_end_0 = rng.end.line       # 0-indexed
+        child_range_1 = set(range(child_start_0 + 1, child_end_0 + 2))
+
+        kind = child.kind()
+        is_func = kind == "function_definition"
+        is_decorated_func = False
+        deco_name = None
+        if kind == "decorated_definition":
+            defn = child.field("definition")
+            if defn is not None and defn.kind() == "function_definition":
+                is_decorated_func = True
+                name_node = defn.field("name")
+                if name_node is not None:
+                    deco_name = name_node.text()
+
+        if child_range_1 & changed_lines:
+            out.extend(lines[child_start_0 : child_end_0 + 1])
+        elif is_func:
+            name_node = child.field("name")
+            name = name_node.text() if name_node is not None else "?"
+            indent = rng.start.column
+            out.append(" " * indent + f"def {name}(self, ...): ...")
+        elif is_decorated_func:
+            name = deco_name or "?"
+            indent = rng.start.column
             out.append(" " * indent + f"def {name}(self, ...): ...")
         else:
-            out.extend(lines[node_start - 1 : node_end])
+            out.extend(lines[child_start_0 : child_end_0 + 1])
 
     return "\n".join(out)
 
 
-def _get_context_python(source: str, changed_lines: set[int]) -> tuple[str, str] | None:
-    """Return (context_str, 'python') for the innermost enclosing scope in a Python file."""
+def _get_context_ast_grep(source: str, changed_lines: set[int], lang: str, rich_lang: str) -> tuple[str, str] | None:
+    """Return (context_str, lang) for the innermost enclosing scope using ast-grep-py."""
     try:
-        tree = ast.parse(source)
-    except SyntaxError:
+        sg_root = SgRoot(source, lang)
+    except Exception:
         return None
 
-    lines = source.splitlines()
-
-    # Collect all scopes with their parent
-    candidates: list[tuple[ast.AST, ast.AST | None, int]] = []  # (node, parent, span)
-    for node in ast.walk(tree):
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                start = child.lineno
-                end = child.end_lineno or start
-                span = end - start
-                node_range = set(range(start, end + 1))
-                if node_range & changed_lines:
-                    candidates.append((child, node, span))
+    root_node = sg_root.root()
+    candidates = []
+    for kind in _SCOPE_KINDS.get(lang, []):
+        for scope_node in root_node.find_all(kind=kind):
+            rng = scope_node.range()
+            start_1 = rng.start.line + 1   # convert 0-indexed → 1-indexed
+            end_1   = rng.end.line   + 1
+            span    = end_1 - start_1
+            if set(range(start_1, end_1 + 1)) & changed_lines:
+                candidates.append((scope_node, span))
 
     if not candidates:
         return None
 
     # Innermost = smallest span
-    candidates.sort(key=lambda t: t[2])
-    innermost, parent, _ = candidates[0]
+    candidates.sort(key=lambda t: t[1])
+    innermost, _ = candidates[0]
 
-    if isinstance(innermost, ast.ClassDef):
-        ctx = _build_python_class_outline(innermost, changed_lines, lines)
+    if lang == "python":
+        if innermost.kind() == "class_definition":
+            ctx = _build_class_outline_sg(innermost, changed_lines, source)
+        else:
+            parent_cls = _find_parent_class_sg(innermost)
+            if parent_cls:
+                ctx = _build_class_outline_sg(parent_cls, changed_lines, source)
+            else:
+                ctx = innermost.text()
         return ctx, "python"
 
-    if isinstance(innermost, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        if isinstance(parent, ast.ClassDef):
-            ctx = _build_python_class_outline(parent, changed_lines, lines)
-            return ctx, "python"
-        # Top-level function
-        start = innermost.lineno - 1
-        end = innermost.end_lineno or (start + 1)
-        ctx = "\n".join(lines[start:end])
-        return ctx, "python"
-
-    return None
-
-
-def _get_context_heuristic(source: str, changed_lines: set[int], ext: str) -> tuple[str, str] | None:
-    """Return (context_str, lang) using regex + brace counting for non-Python files."""
-    lang = _EXT_TO_RICH_LANG.get(ext, "text")
-    lines = source.splitlines()
-    if not lines or not changed_lines:
-        return None
-
-    min_line = min(changed_lines)  # 1-indexed
-    search_start = min_line - 2  # 0-indexed; line just before the change
-
-    # Scan backward up to 200 lines for a block-start
-    block_start_idx: int | None = None
-    for i in range(search_start, max(-1, search_start - 200), -1):
-        if 0 <= i < len(lines) and _BLOCK_START_RE.match(lines[i]):
-            block_start_idx = i
-            break
-
-    if block_start_idx is None:
-        return None
-
-    # Forward scan: count braces to find end
-    depth = 0
-    found_open = False
-    block_end_idx = len(lines) - 1
-    for i in range(block_start_idx, len(lines)):
-        for ch in lines[i]:
-            if ch == "{":
-                depth += 1
-                found_open = True
-            elif ch == "}":
-                depth -= 1
-        if found_open and depth <= 0:
-            block_end_idx = i
-            break
-
-    if not found_open:
-        # Indentation-based or one-liner; fall back to changed_lines extent + 5
-        block_end_idx = min(max(changed_lines) + 4, len(lines) - 1)
-
-    ctx = "\n".join(lines[block_start_idx : block_end_idx + 1])
-    return ctx, lang
+    return innermost.text(), rich_lang
 
 
 def _get_context_for_file(filepath: str, changed_lines: set[int]) -> tuple[str, str] | None:
@@ -283,11 +271,11 @@ def _get_context_for_file(filepath: str, changed_lines: set[int]) -> tuple[str, 
         return None
 
     ext = Path(filepath).suffix.lower()
-    if ext == ".py":
-        return _get_context_python(source, changed_lines)
-    if _EXT_TO_RICH_LANG.get(ext) is None:
+    ag_lang = _EXT_TO_ASTGREP_LANG.get(ext)
+    if ag_lang is None:
         return None
-    return _get_context_heuristic(source, changed_lines, ext)
+    rich_lang = _EXT_TO_RICH_LANG.get(ext, "text")
+    return _get_context_ast_grep(source, changed_lines, ag_lang, rich_lang)
 
 
 def _render_context_panels(chunk: dict) -> list[tuple[str, Syntax]]:
