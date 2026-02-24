@@ -128,7 +128,7 @@ _JSON_SCHEMA = {
 
 
 def _parse_chunk_locations(diff_text: str) -> list[tuple[str, set[int]]]:
-    """Parse a unified diff and return [(filepath, {new-file line numbers of added lines})]."""
+    """Parse a unified diff and return [(filepath, {new-file line numbers of changed lines})]."""
     results: list[tuple[str, set[int]]] = []
     current_file: str | None = None
     current_lines: set[int] = set()
@@ -150,11 +150,14 @@ def _parse_chunk_locations(diff_text: str) -> list[tuple[str, set[int]]]:
             if m:
                 new_cursor = int(m.group(1))
         elif current_file is not None:
+            if line.startswith("\\"):
+                continue  # skip "\ No newline at end of file" marker
             if line.startswith("+"):
                 current_lines.add(new_cursor)
                 new_cursor += 1
             elif line.startswith("-"):
-                pass  # deleted line; don't advance new_cursor
+                current_lines.add(new_cursor)  # mark deletion position in new file
+                # don't advance new_cursor — deleted lines don't exist in new file
             else:
                 new_cursor += 1
 
@@ -525,6 +528,17 @@ def _display(analysis: dict) -> None:
             console.print(Syntax(diff_text, "diff", theme="ansi_dark"))
 
 
+def _count_diff_changes(diff_text: str) -> int:
+    """Count the number of +/- content lines in a unified diff."""
+    count = 0
+    for line in diff_text.splitlines():
+        if line.startswith("+++ ") or line.startswith("--- "):
+            continue
+        if line.startswith("+") or line.startswith("-"):
+            count += 1
+    return count
+
+
 def run_analyze(
     ref: Optional[str],
     model: Optional[str],
@@ -583,6 +597,18 @@ def run_analyze(
         if preview:
             err_console.print(f"[dim]claude returned:[/dim]\n{preview}")
         raise typer.Exit(1)
+
+    original_changes = _count_diff_changes(diff)
+    chunk_changes = sum(
+        _count_diff_changes(c.get("diff", ""))
+        for c in result.structured.get("chunks", [])
+    )
+    if chunk_changes < original_changes:
+        pct = round(100 * chunk_changes / original_changes) if original_changes else 0
+        err_console.print(
+            f"[yellow]warning:[/yellow] chunks cover {pct}% of changes "
+            f"({chunk_changes}/{original_changes} lines)"
+        )
 
     if debug:
         cost = f"${result.cost_usd:.4f}" if result.cost_usd else "n/a"
