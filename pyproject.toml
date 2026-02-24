@@ -12,6 +12,7 @@ dependencies = [
     "typer>=0.12",
     "rich>=13",
     "claude-agent-sdk>=0.1.39",
+    "ast-grep-py>=0.41.0",
 ]
 
 [project.scripts]

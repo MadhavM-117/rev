@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -29,6 +31,29 @@ err_console = Console(stderr=True)
 
 _KEY_RIGHT = "\x1b[C"
 _KEY_LEFT = "\x1b[D"
+
+_DEFAULT_MODEL = "claude-haiku-4-5"
+
+_EXT_TO_RICH_LANG: dict[str, str] = {
+    ".py": "python", ".js": "javascript", ".jsx": "jsx",
+    ".ts": "typescript", ".tsx": "typescript",
+    ".go": "go", ".rs": "rust", ".java": "java",
+    ".c": "c", ".h": "c", ".cpp": "cpp", ".cc": "cpp",
+    ".hpp": "cpp", ".cxx": "cpp", ".rb": "ruby",
+    ".kt": "kotlin", ".swift": "swift", ".cs": "csharp",
+    ".sh": "bash",
+}
+
+_BLOCK_START_RE = re.compile(
+    r'^\s*(?:'
+    r'(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+\w+'
+    r'|(?:export\s+)?(?:abstract\s+)?class\s+\w+'
+    r'|(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?(?:async\s+)?fn\s+\w+'
+    r'|func\s+(?:\([^)]*\)\s+)?\w+'
+    r'|(?:(?:public|private|protected|internal|static|async|override|virtual|abstract)\s+)*'
+    r'  [\w<>\[\]]+\s+\w+\s*\('
+    r')'
+)
 
 _SYSTEM_PROMPT = """\
 You are a senior engineer performing a code review.
@@ -81,6 +106,208 @@ _JSON_SCHEMA = {
         },
     },
 }
+
+
+def _parse_chunk_locations(diff_text: str) -> list[tuple[str, set[int]]]:
+    """Parse a unified diff and return [(filepath, {new-file line numbers of added lines})]."""
+    results: list[tuple[str, set[int]]] = []
+    current_file: str | None = None
+    current_lines: set[int] = set()
+    new_cursor = 0
+
+    for line in diff_text.splitlines():
+        if line.startswith("+++ "):
+            if current_file is not None:
+                results.append((current_file, current_lines))
+            path = line[4:]
+            if path.startswith("b/"):
+                path = path[2:]
+            current_file = None if path == "/dev/null" else path
+            current_lines = set()
+            new_cursor = 0
+        elif line.startswith("@@ "):
+            # @@ -old_start[,old_count] +new_start[,new_count] @@
+            m = re.search(r'\+(\d+)', line)
+            if m:
+                new_cursor = int(m.group(1))
+        elif current_file is not None:
+            if line.startswith("+"):
+                current_lines.add(new_cursor)
+                new_cursor += 1
+            elif line.startswith("-"):
+                pass  # deleted line; don't advance new_cursor
+            else:
+                new_cursor += 1
+
+    if current_file is not None:
+        results.append((current_file, current_lines))
+
+    return results
+
+
+def _build_python_class_outline(cls_node: ast.ClassDef, changed_lines: set[int], lines: list[str]) -> str:
+    """Return a collapsed class outline with full methods only where lines overlap changed_lines."""
+    out: list[str] = []
+
+    # Class header up to first body line
+    header_end = cls_node.body[0].lineno - 1 if cls_node.body else cls_node.end_lineno
+    out.extend(lines[cls_node.lineno - 1 : header_end])
+
+    # Docstring if present
+    first = cls_node.body[0] if cls_node.body else None
+    if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
+        out.extend(lines[first.lineno - 1 : first.end_lineno])
+        body_nodes = cls_node.body[1:]
+    else:
+        body_nodes = cls_node.body
+
+    for node in body_nodes:
+        node_start = getattr(node, 'lineno', None)
+        node_end = getattr(node, 'end_lineno', None)
+        if node_start is None or node_end is None:
+            continue
+        node_range = set(range(node_start, node_end + 1))
+        if node_range & changed_lines:
+            # Include decorators
+            deco_start = node_start
+            if hasattr(node, 'decorator_list') and node.decorator_list:
+                deco_start = node.decorator_list[0].lineno
+            out.extend(lines[deco_start - 1 : node_end])
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            indent = len(lines[node_start - 1]) - len(lines[node_start - 1].lstrip())
+            name = node.name
+            out.append(" " * indent + f"def {name}(self, ...): ...")
+        else:
+            out.extend(lines[node_start - 1 : node_end])
+
+    return "\n".join(out)
+
+
+def _get_context_python(source: str, changed_lines: set[int]) -> tuple[str, str] | None:
+    """Return (context_str, 'python') for the innermost enclosing scope in a Python file."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+
+    lines = source.splitlines()
+
+    # Collect all scopes with their parent
+    candidates: list[tuple[ast.AST, ast.AST | None, int]] = []  # (node, parent, span)
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                start = child.lineno
+                end = child.end_lineno or start
+                span = end - start
+                node_range = set(range(start, end + 1))
+                if node_range & changed_lines:
+                    candidates.append((child, node, span))
+
+    if not candidates:
+        return None
+
+    # Innermost = smallest span
+    candidates.sort(key=lambda t: t[2])
+    innermost, parent, _ = candidates[0]
+
+    if isinstance(innermost, ast.ClassDef):
+        ctx = _build_python_class_outline(innermost, changed_lines, lines)
+        return ctx, "python"
+
+    if isinstance(innermost, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if isinstance(parent, ast.ClassDef):
+            ctx = _build_python_class_outline(parent, changed_lines, lines)
+            return ctx, "python"
+        # Top-level function
+        start = innermost.lineno - 1
+        end = innermost.end_lineno or (start + 1)
+        ctx = "\n".join(lines[start:end])
+        return ctx, "python"
+
+    return None
+
+
+def _get_context_heuristic(source: str, changed_lines: set[int], ext: str) -> tuple[str, str] | None:
+    """Return (context_str, lang) using regex + brace counting for non-Python files."""
+    lang = _EXT_TO_RICH_LANG.get(ext, "text")
+    lines = source.splitlines()
+    if not lines or not changed_lines:
+        return None
+
+    min_line = min(changed_lines)  # 1-indexed
+    search_start = min_line - 2  # 0-indexed; line just before the change
+
+    # Scan backward up to 200 lines for a block-start
+    block_start_idx: int | None = None
+    for i in range(search_start, max(-1, search_start - 200), -1):
+        if 0 <= i < len(lines) and _BLOCK_START_RE.match(lines[i]):
+            block_start_idx = i
+            break
+
+    if block_start_idx is None:
+        return None
+
+    # Forward scan: count braces to find end
+    depth = 0
+    found_open = False
+    block_end_idx = len(lines) - 1
+    for i in range(block_start_idx, len(lines)):
+        for ch in lines[i]:
+            if ch == "{":
+                depth += 1
+                found_open = True
+            elif ch == "}":
+                depth -= 1
+        if found_open and depth <= 0:
+            block_end_idx = i
+            break
+
+    if not found_open:
+        # Indentation-based or one-liner; fall back to changed_lines extent + 5
+        block_end_idx = min(max(changed_lines) + 4, len(lines) - 1)
+
+    ctx = "\n".join(lines[block_start_idx : block_end_idx + 1])
+    return ctx, lang
+
+
+def _get_context_for_file(filepath: str, changed_lines: set[int]) -> tuple[str, str] | None:
+    """Return (context_str, lang) for the given file and changed lines, or None on any failure."""
+    repo_root = _repo_root()
+    if not repo_root or not changed_lines:
+        return None
+    abs_path = Path(repo_root) / filepath
+    try:
+        source = abs_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    ext = Path(filepath).suffix.lower()
+    if ext == ".py":
+        return _get_context_python(source, changed_lines)
+    if _EXT_TO_RICH_LANG.get(ext) is None:
+        return None
+    return _get_context_heuristic(source, changed_lines, ext)
+
+
+def _render_context_panels(chunk: dict) -> list[tuple[str, Syntax]]:
+    """Return a list of (filepath, Syntax) panels for the chunk's diff context."""
+    panels: list[tuple[str, Syntax]] = []
+    try:
+        for filepath, changed_lines in _parse_chunk_locations(chunk.get("diff", "")):
+            try:
+                result = _get_context_for_file(filepath, changed_lines)
+                if result:
+                    ctx, lang = result
+                    panels.append((
+                        filepath,
+                        Syntax(ctx, lang, theme="ansi_dark", line_numbers=True),
+                    ))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return panels
 
 
 def _cache_dir() -> Path:
@@ -211,6 +438,9 @@ def _render_chunk(idx: int, chunks: list, analysis: dict, con: Console) -> None:
         )
     )
 
+    for fp, syntax_obj in _render_context_panels(chunk):
+        con.print(Panel(syntax_obj, title=f"[dim]Context: {fp}[/dim]", border_style="dim"))
+
     con.print(Rule())
 
     if diff_text:
@@ -299,6 +529,9 @@ def _display(analysis: dict) -> None:
 
         console.print(Panel(body, border_style="yellow"))
 
+        for fp, syntax_obj in _render_context_panels(chunk):
+            console.print(Panel(syntax_obj, title=f"[dim]Context: {fp}[/dim]", border_style="dim"))
+
         diff_text = chunk.get("diff", "")
         if diff_text:
             console.print(Syntax(diff_text, "diff", theme="ansi_dark"))
@@ -318,7 +551,8 @@ def run_analyze(
         console.print("[yellow]warning:[/yellow] diff is empty — nothing to analyze")
         raise typer.Exit(0)
 
-    cache_model = model or "default"
+    effective_model = model or _DEFAULT_MODEL
+    cache_model = effective_model
 
     if cache and not raw:
         cached = _load_cache(diff, cache_model)
@@ -330,7 +564,7 @@ def run_analyze(
         if debug:
             err_console.print("[dim]debug: cache miss[/dim]")
 
-    runner = ClaudeRunner(model=model, timeout=timeout, max_turns=2, debug=debug)
+    runner = ClaudeRunner(model=effective_model, timeout=timeout, max_turns=2, debug=debug)
 
     try:
         if debug:
