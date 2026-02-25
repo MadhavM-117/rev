@@ -328,18 +328,39 @@ def _save_cache(diff_text: str, model: str, analysis: dict) -> None:
 
 def _get_diff(ref: Optional[str]) -> str:
     """Acquire the diff from stdin, a git ref, or bare git diff."""
-    if not sys.stdin.isatty():
-        diff = sys.stdin.read()
-        return diff
+    # If ref is explicitly provided, use git diff with that ref
+    if ref is not None:
+        if not shutil.which("git"):
+            err_console.print("[red]error:[/red] git not found in PATH")
+            raise typer.Exit(1)
+        cmd = ["git", "diff", ref]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        except FileNotFoundError:
+            err_console.print("[red]error:[/red] git not found in PATH")
+            raise typer.Exit(1)
+        if result.returncode != 0:
+            err_console.print(f"[red]git error:[/red] {result.stderr.strip()}")
+            raise typer.Exit(1)
+        return result.stdout
 
+    # No ref provided - check if stdin has actual data to read
+    # Use select to check for readable data without blocking
+    if not sys.stdin.isatty():
+        import select
+        # Check if stdin has data available (timeout=0 means don't block)
+        readable, _, _ = select.select([sys.stdin], [], [], 0)
+        if readable:
+            diff = sys.stdin.read()
+            return diff
+
+    # Fall back to git diff of working tree
     if not shutil.which("git"):
         err_console.print("[red]error:[/red] git not found in PATH")
         raise typer.Exit(1)
 
-    cmd = ["git", "diff"] if ref is None else ["git", "diff", ref]
-
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        result = subprocess.run(["git", "diff"], capture_output=True, text=True, check=False)
     except FileNotFoundError:
         err_console.print("[red]error:[/red] git not found in PATH")
         raise typer.Exit(1)
