@@ -1,5 +1,7 @@
 # AI coding 
 plans/
+tmp/
+cache/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
