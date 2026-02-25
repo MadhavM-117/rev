@@ -12,6 +12,7 @@ import sys
 import termios
 import tty
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -127,143 +128,64 @@ _JSON_SCHEMA = {
 }
 
 
-def _parse_chunk_locations(diff_text: str) -> list[tuple[str, set[int]]]:
-    """Parse a unified diff and return [(filepath, {new-file line numbers of changed lines})]."""
-    results: list[tuple[str, set[int]]] = []
+@dataclass
+class _FileDiff:
+    additions: set[int] = field(default_factory=set)
+    deletions_at: dict[int, list[str]] = field(default_factory=dict)
+
+    @property
+    def changed_lines(self) -> set[int]:
+        return self.additions | self.deletions_at.keys()
+
+
+def _parse_diff_details(diff_text: str) -> dict[str, _FileDiff]:
+    """Parse a unified diff into {filepath: _FileDiff}."""
+    result: dict[str, _FileDiff] = {}
     current_file: str | None = None
-    current_lines: set[int] = set()
+    current_diff: _FileDiff | None = None
     new_cursor = 0
+
+    def _flush() -> None:
+        if current_file is None or current_diff is None:
+            return
+        if current_file in result:
+            result[current_file].additions |= current_diff.additions
+            for pos, texts in current_diff.deletions_at.items():
+                result[current_file].deletions_at.setdefault(pos, []).extend(texts)
+        else:
+            result[current_file] = current_diff
 
     for line in diff_text.splitlines():
         if line.startswith("+++ "):
-            if current_file is not None:
-                results.append((current_file, current_lines))
+            _flush()
             path = line[4:]
             if path.startswith("b/"):
                 path = path[2:]
             current_file = None if path == "/dev/null" else path
-            current_lines = set()
+            current_diff = _FileDiff() if current_file else None
             new_cursor = 0
         elif line.startswith("@@ "):
-            # @@ -old_start[,old_count] +new_start[,new_count] @@
             m = re.search(r'\+(\d+)', line)
             if m:
                 new_cursor = int(m.group(1))
-        elif current_file is not None:
+        elif current_file is not None and current_diff is not None:
             if line.startswith("\\"):
                 continue  # skip "\ No newline at end of file" marker
             if line.startswith("+"):
-                current_lines.add(new_cursor)
+                current_diff.additions.add(new_cursor)
                 new_cursor += 1
             elif line.startswith("-"):
-                current_lines.add(new_cursor)  # mark deletion position in new file
+                current_diff.deletions_at.setdefault(new_cursor, []).append(line[1:])
                 # don't advance new_cursor — deleted lines don't exist in new file
             else:
                 new_cursor += 1
 
-    if current_file is not None:
-        results.append((current_file, current_lines))
-
-    return results
+    _flush()
+    return result
 
 
-def _find_parent_class_sg(node) -> "SgNode | None":
-    """Walk ancestors until a class_definition is found, or return None."""
-    p = node.parent()
-    while p is not None:
-        if p.kind() == "class_definition":
-            return p
-        p = p.parent()
-    return None
-
-
-def _build_class_outline_sg(cls_node, changed_lines: set[int], source: str) -> str:
-    """Return a collapsed class outline with full methods only where lines overlap changed_lines."""
-    lines = source.splitlines()
-    cls_start = cls_node.range().start.line  # 0-indexed
-    body = cls_node.field("body")
-    body_start = body.range().start.line  # 0-indexed
-
-    out: list[str] = list(lines[cls_start : body_start])
-
-    for child in body.children():
-        if not child.is_named():
-            continue
-        rng = child.range()
-        child_start_0 = rng.start.line   # 0-indexed
-        child_end_0 = rng.end.line       # 0-indexed
-        child_range_1 = set(range(child_start_0 + 1, child_end_0 + 2))
-
-        kind = child.kind()
-        is_func = kind == "function_definition"
-        is_decorated_func = False
-        deco_name = None
-        if kind == "decorated_definition":
-            defn = child.field("definition")
-            if defn is not None and defn.kind() == "function_definition":
-                is_decorated_func = True
-                name_node = defn.field("name")
-                if name_node is not None:
-                    deco_name = name_node.text()
-
-        if child_range_1 & changed_lines:
-            out.extend(lines[child_start_0 : child_end_0 + 1])
-        elif is_func:
-            name_node = child.field("name")
-            name = name_node.text() if name_node is not None else "?"
-            indent = rng.start.column
-            out.append(" " * indent + f"def {name}(self, ...): ...")
-        elif is_decorated_func:
-            name = deco_name or "?"
-            indent = rng.start.column
-            out.append(" " * indent + f"def {name}(self, ...): ...")
-        else:
-            out.extend(lines[child_start_0 : child_end_0 + 1])
-
-    return "\n".join(out)
-
-
-def _get_context_ast_grep(source: str, changed_lines: set[int], lang: str, rich_lang: str) -> tuple[str, str] | None:
-    """Return (context_str, lang) for the innermost enclosing scope using ast-grep-py."""
-    try:
-        sg_root = SgRoot(source, lang)
-    except Exception:
-        return None
-
-    root_node = sg_root.root()
-    candidates = []
-    for kind in _SCOPE_KINDS.get(lang, []):
-        for scope_node in root_node.find_all(kind=kind):
-            rng = scope_node.range()
-            start_1 = rng.start.line + 1   # convert 0-indexed → 1-indexed
-            end_1   = rng.end.line   + 1
-            span    = end_1 - start_1
-            if set(range(start_1, end_1 + 1)) & changed_lines:
-                candidates.append((scope_node, span))
-
-    if not candidates:
-        return None
-
-    # Innermost = smallest span
-    candidates.sort(key=lambda t: t[1])
-    innermost, _ = candidates[0]
-
-    if lang == "python":
-        if innermost.kind() == "class_definition":
-            ctx = _build_class_outline_sg(innermost, changed_lines, source)
-        else:
-            parent_cls = _find_parent_class_sg(innermost)
-            if parent_cls:
-                ctx = _build_class_outline_sg(parent_cls, changed_lines, source)
-            else:
-                ctx = innermost.text()
-        return ctx, "python"
-
-    return innermost.text(), rich_lang
-
-
-def _get_context_for_file(filepath: str, changed_lines: set[int]) -> tuple[str, str] | None:
-    """Return (context_str, lang) for the given file and changed lines, or None on any failure."""
+def _find_enclosing_scope_range(filepath: str, changed_lines: set[int]) -> tuple[int, int, str] | None:
+    """Return (start_1, end_1, rich_lang) for the innermost enclosing scope, or None."""
     repo_root = _repo_root()
     if not repo_root or not changed_lines:
         return None
@@ -278,24 +200,84 @@ def _get_context_for_file(filepath: str, changed_lines: set[int]) -> tuple[str, 
     if ag_lang is None:
         return None
     rich_lang = _EXT_TO_RICH_LANG.get(ext, "text")
-    return _get_context_ast_grep(source, changed_lines, ag_lang, rich_lang)
 
-
-def _render_context_panels(chunk: dict) -> list[tuple[str, Syntax]]:
-    """Return a list of (filepath, Syntax) panels for the chunk's diff context."""
-    panels: list[tuple[str, Syntax]] = []
     try:
-        for filepath, changed_lines in _parse_chunk_locations(chunk.get("diff", "")):
+        sg_root = SgRoot(source, ag_lang)
+    except Exception:
+        return None
+
+    root_node = sg_root.root()
+    candidates: list[tuple[int, int, int]] = []
+    for kind in _SCOPE_KINDS.get(ag_lang, []):
+        for scope_node in root_node.find_all(kind=kind):
+            rng = scope_node.range()
+            start_1 = rng.start.line + 1
+            end_1 = rng.end.line + 1
+            span = end_1 - start_1
+            if set(range(start_1, end_1 + 1)) & changed_lines:
+                candidates.append((start_1, end_1, span))
+
+    if not candidates:
+        return None
+
+    # Innermost = smallest span
+    candidates.sort(key=lambda t: t[2])
+    start_1, end_1, _ = candidates[0]
+    return start_1, end_1, rich_lang
+
+
+def _build_interleaved_diff(
+    source_lines: list[str],
+    scope_start: int,
+    scope_end: int,
+    file_diff: _FileDiff,
+) -> str:
+    """Produce a diff-formatted string interleaving scope source with +/- lines."""
+    out: list[str] = []
+    for line_num in range(scope_start, scope_end + 1):
+        # First emit any deletions at this position
+        for del_text in file_diff.deletions_at.get(line_num, []):
+            out.append(f"-{del_text}")
+        # Then emit the source line
+        if line_num <= len(source_lines):
+            src = source_lines[line_num - 1]  # 1-indexed to 0-indexed
+            if line_num in file_diff.additions:
+                out.append(f"+{src}")
+            else:
+                out.append(f" {src}")
+    # Trailing deletions just past the scope end
+    for del_text in file_diff.deletions_at.get(scope_end + 1, []):
+        out.append(f"-{del_text}")
+    return "\n".join(out)
+
+
+def _render_interleaved_panels(chunk: dict) -> list[tuple[str, Syntax]]:
+    """Return a list of (filepath, Syntax) interleaved panels for the chunk."""
+    panels: list[tuple[str, Syntax]] = []
+    diff_details = _parse_diff_details(chunk.get("diff", ""))
+    try:
+        for fp in chunk.get("files", []):
+            if fp not in diff_details:
+                continue
+            file_diff = diff_details[fp]
+            result = _find_enclosing_scope_range(fp, file_diff.changed_lines)
+            if result is None:
+                continue
+            scope_start, scope_end, _rich_lang = result
+            repo_root = _repo_root()
+            if not repo_root:
+                continue
+            abs_path = Path(repo_root) / fp
             try:
-                result = _get_context_for_file(filepath, changed_lines)
-                if result:
-                    ctx, lang = result
-                    panels.append((
-                        filepath,
-                        Syntax(ctx, lang, theme="ansi_dark", line_numbers=True),
-                    ))
-            except Exception:
-                pass
+                source = abs_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            source_lines = source.splitlines()
+            interleaved = _build_interleaved_diff(source_lines, scope_start, scope_end, file_diff)
+            panels.append((
+                fp,
+                Syntax(interleaved, "diff", theme="ansi_dark"),
+            ))
     except Exception:
         pass
     return panels
@@ -429,12 +411,14 @@ def _render_chunk(idx: int, chunks: list, analysis: dict, con: Console) -> None:
         )
     )
 
-    for fp, syntax_obj in _render_context_panels(chunk):
-        con.print(Panel(syntax_obj, title=f"[dim]Context: {fp}[/dim]", border_style="dim"))
+    interleaved = _render_interleaved_panels(chunk)
 
     con.print(Rule())
 
-    if diff_text:
+    if interleaved:
+        for fp, syntax_obj in interleaved:
+            con.print(Panel(syntax_obj, title=f"[dim]{fp}[/dim]", border_style="dim"))
+    elif diff_text:
         con.print(Syntax(diff_text, "diff", theme="ansi_dark"))
 
     con.print(Rule())
@@ -520,12 +504,14 @@ def _display(analysis: dict) -> None:
 
         console.print(Panel(body, border_style="yellow"))
 
-        for fp, syntax_obj in _render_context_panels(chunk):
-            console.print(Panel(syntax_obj, title=f"[dim]Context: {fp}[/dim]", border_style="dim"))
-
-        diff_text = chunk.get("diff", "")
-        if diff_text:
-            console.print(Syntax(diff_text, "diff", theme="ansi_dark"))
+        interleaved = _render_interleaved_panels(chunk)
+        if interleaved:
+            for fp, syntax_obj in interleaved:
+                console.print(Panel(syntax_obj, title=f"[dim]{fp}[/dim]", border_style="dim"))
+        else:
+            diff_text = chunk.get("diff", "")
+            if diff_text:
+                console.print(Syntax(diff_text, "diff", theme="ansi_dark"))
 
 
 def _count_diff_changes(diff_text: str) -> int:
