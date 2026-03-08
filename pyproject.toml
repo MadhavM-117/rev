@@ -13,6 +13,7 @@ dependencies = [
     "rich>=13",
     "claude-agent-sdk>=0.1.39",
     "ast-grep-py>=0.41.0",
+    "git-python>=1.0.3",
 ]
 
 [project.scripts]
