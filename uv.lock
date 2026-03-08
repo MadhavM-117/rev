@@ -354,18 +354,6 @@ wheels = [
 ]
 
 [[package]]
-name = "git-python"
-version = "1.0.3"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "gitpython" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/5b/3c/f0726fd577517ff8f09e6fe49f153ec9c595f1964c02c209c757d473780a/git-python-1.0.3.zip", hash = "sha256:a7f51d07c7a0b0a15cb4dfa78601196dd20624211153d07c092b811edb6e86fb", size = 4286, upload-time = "2019-10-13T10:30:24.257Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/8a/de/0cc6353a45cdb1e137cffac5383097b300cc578e2e1133eeb847e23a1394/git_python-1.0.3-py2.py3-none-any.whl", hash = "sha256:8820ce93786cd11a76d44c7153708588e8056213e4c512406ea3732871aa9ad6", size = 1888, upload-time = "2019-10-13T10:30:22.489Z" },
-]
-
-[[package]]
 name = "gitdb"
 version = "4.0.12"
 source = { registry = "https://pypi.org/simple" }
@@ -790,7 +778,7 @@ source = { editable = "." }
 dependencies = [
     { name = "ast-grep-py" },
     { name = "claude-agent-sdk" },
-    { name = "git-python" },
+    { name = "gitpython" },
     { name = "rich" },
     { name = "typer" },
 ]
@@ -805,7 +793,7 @@ dev = [
 requires-dist = [
     { name = "ast-grep-py", specifier = ">=0.41.0" },
     { name = "claude-agent-sdk", specifier = ">=0.1.39" },
-    { name = "git-python", specifier = ">=1.0.3" },
+    { name = "gitpython", specifier = ">=3.1.46" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5.0" },
     { name = "rich", specifier = ">=13" },
